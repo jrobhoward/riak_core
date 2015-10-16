@@ -56,9 +56,9 @@ command(S = #state{started = Started}) ->
         %% [{50, {call, ?MODULE, delete, [t1, key()]}} || Started] ++
         %% [{50, {call, ?MODULE, delete, [t2, key()]}} || Started] ++
         %% [{100,{call, ?MODULE, delete_both, [key()]}} || Started] ++
-        [{1, {call, ?MODULE, reopen_tree, [S#state.params, t1]}} || Started] ++
-        [{1, {call, ?MODULE, reopen_tree, [S#state.params, t2]}} || Started] ++
-          [{1, {call, ?MODULE, reconcile, [S#state.only1, S#state.only2]}} || Started] ++
+        %% [{1, {call, ?MODULE, reopen_tree, [S#state.params, t1]}} || Started] ++
+        %% [{1, {call, ?MODULE, reopen_tree, [S#state.params, t2]}} || Started] ++
+          [{1, {call, ?MODULE, reconcile, []}} || Started] ++
           %% TODO: Add rehash_tree
         []
     ).
@@ -72,10 +72,13 @@ start(Params) ->
     put(t2, hashtree:new({0,0}, [{segments, Segments},
                                  {width, Width},
                                  {mem_levels, MemLevels}])),
+    ets:new(t1, [named_table, public, set]),
+    ets:new(t2, [named_table, public, set]),
     true.
 
 write(T, {Key, Hash}) ->
     put(T, hashtree:insert(Key, Hash, get(T))), % write to tree and return previous state
+    ets:insert(T, {Key, Hash}),
     ok.
 
 write_both({_Key, _Hash}=KH) ->
@@ -85,6 +88,7 @@ write_both({_Key, _Hash}=KH) ->
 
 delete(T, Key) ->
     put(T, hashtree:delete(Key, get(T))),
+    ets:delete(T, Key),
     ok.
 
 delete_both(Key) ->
@@ -108,7 +112,7 @@ reopen_tree(Params, T) ->
     ok.
 
 
-reconcile(Only1, Only2) ->
+reconcile() ->
     put(t1, hashtree:update_tree(get(t1))),
     put(t2, hashtree:update_tree(get(t2))),
     KeyDiff = hashtree:local_compare(get(t1), get(t2)),
@@ -122,6 +126,9 @@ reconcile(Only1, Only2) ->
                                          Acc
                         end, T, Vals)
              end,
+    %% Lazy reuse of existing code - could be changed to check ETS directly
+    Only1 = ets:tab2list(t1),
+    Only2 = ets:tab2list(t2),
 
     Insert(t1, [lists:keyfind(K, 1, Only2) ||  K <- Missing, lists:keyfind(K, 1,
                 Only2) /= false]),
@@ -166,12 +173,12 @@ next_state(S,_V,{call, _, delete, [t2, Key]}) ->
 next_state(S,_R,{call, _, delete_both, [Key]}) ->
     S#state{only1=lists:keydelete(Key, 1, S#state.only1),
             only2=lists:keydelete(Key, 1, S#state.only2)};
-next_state(S,_R,{call, _, reconcile, [_]}) ->
+next_state(S,_R,{call, _, reconcile, []}) ->
     Keys = lists:ukeymerge(1, lists:ukeysort(1, S#state.only1),
                            lists:ukeysort(1, S#state.only2)),
     S#state{only1 = Keys,
             only2 = Keys};
-next_state(S,_R,{call, _, _F, _A}) ->
+next_state(S,_R,{call, _, update_tree, _A}) ->
     S.
 
 
@@ -182,6 +189,8 @@ prop_correct() ->
                     %io:format(user, "Starting in ~p\n", [self()]),
                     put(t1, undefined),
                     put(t2, undefined),
+                    catch ets:delete(t1),
+                    catch ets:delete(t2),
                     {_H,S,Res} = HSR = run_commands(?MODULE,Cmds),
                     pretty_commands(?MODULE, Cmds, HSR,
                                     ?WHENFAIL(
