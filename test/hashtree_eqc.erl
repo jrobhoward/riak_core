@@ -23,11 +23,9 @@ hashtree_test_() ->
 -record(state,
     {
       started = false,
+      params = undefined,
       only1 = [],
-      only2 = [],
-      segments,
-      width,
-      mem_levels
+      only2 = []
     }).
 
 integer_to_binary(Int) ->
@@ -49,23 +47,24 @@ object(_S) ->
 
 command(S = #state{started = Started}) ->
     frequency(
-        [{1, {call, ?MODULE, start, [oneof(?POWERS), oneof(?POWERS), choose(0, 4)]}} || not Started] ++
+        [{1, {call, ?MODULE, start, [{oneof(?POWERS), oneof(?POWERS), choose(0, 4)}]}} || not Started] ++
         [{1, {call, ?MODULE, update_tree, [t1]}} || Started] ++
         [{1, {call, ?MODULE, update_tree, [t2]}} || Started] ++
         [{50, {call, ?MODULE, write, [t1, object(S)]}} || Started] ++
         [{50, {call, ?MODULE, write, [t2, object(S)]}} || Started] ++
         [{100,{call, ?MODULE, write_both, [object(S)]}} || Started] ++
-        [{50, {call, ?MODULE, delete, [t1, key()]}} || Started] ++
-        [{50, {call, ?MODULE, delete, [t2, key()]}} || Started] ++
-        [{100,{call, ?MODULE, delete_both, [key()]}} || Started] ++
-        [{1, {call, ?MODULE, reopen_tree, [S, t1]}} || Started] ++
-        [{1, {call, ?MODULE, reopen_tree, [S, t2]}} || Started] ++
-          [{1, {call, ?MODULE, reconcile, [S]}} || Started] ++
+        %% [{50, {call, ?MODULE, delete, [t1, key()]}} || Started] ++
+        %% [{50, {call, ?MODULE, delete, [t2, key()]}} || Started] ++
+        %% [{100,{call, ?MODULE, delete_both, [key()]}} || Started] ++
+        [{1, {call, ?MODULE, reopen_tree, [S#state.params, t1]}} || Started] ++
+        [{1, {call, ?MODULE, reopen_tree, [S#state.params, t2]}} || Started] ++
+          [{1, {call, ?MODULE, reconcile, [S#state.only1, S#state.only2]}} || Started] ++
           %% TODO: Add rehash_tree
         []
     ).
 
-start(Segments, Width, MemLevels) ->
+start(Params) ->
+    {Segments, Width, MemLevels} = Params,
     %% Return now so we can store symbolic value in procdict in next_state call
     put(t1, hashtree:new({0,0}, [{segments, Segments},
                                  {width, Width},
@@ -97,19 +96,19 @@ update_tree(T) ->
     put(T, hashtree:update_tree(get(T))),
     ok.
 
-reopen_tree(S, T) ->
-    ?assert(get(T) /= undefined),
+reopen_tree(Params, T) ->
+    {Segments, Width, MemLevels} = Params,
     HT = hashtree:flush_buffer(get(T)),
     Path = hashtree:path(HT),
     hashtree:close(HT),
-    put(T, hashtree:new({0,0}, [{segments, S#state.segments},
-                                {width, S#state.width},
-                                {mem_levels, S#state.mem_levels},
+    put(T, hashtree:new({0,0}, [{segments, Segments},
+                                {width, Width},
+                                {mem_levels, MemLevels},
                                 {segment_path, Path}])),
     ok.
 
 
-reconcile(S) ->
+reconcile(Only1, Only2) ->
     put(t1, hashtree:update_tree(get(t1))),
     put(t2, hashtree:update_tree(get(t2))),
     KeyDiff = hashtree:local_compare(get(t1), get(t2)),
@@ -124,13 +123,12 @@ reconcile(S) ->
                         end, T, Vals)
              end,
 
-    Insert(t1, [lists:keyfind(K, 1, S#state.only2) ||  K <- Missing, lists:keyfind(K, 1,
-                S#state.only2) /= false]),
-    Insert(t2, [lists:keyfind(K, 1, S#state.only1) ||  K <- RemoteMissing, lists:keyfind(K, 1,
-                S#state.only1) /= false]),
-    Insert(t2, [lists:keyfind(K, 1, S#state.only1) ||  K <- Different, lists:keyfind(K, 1,
-                S#state.only1) /= false]),
-    %% Res = {hashtree:update_tree(A3), hashtree:update_tree(B4)},
+    Insert(t1, [lists:keyfind(K, 1, Only2) ||  K <- Missing, lists:keyfind(K, 1,
+                Only2) /= false]),
+    Insert(t2, [lists:keyfind(K, 1, Only1) ||  K <- RemoteMissing, lists:keyfind(K, 1,
+                Only1) /= false]),
+    Insert(t2, [lists:keyfind(K, 1, Only1) ||  K <- Different, lists:keyfind(K, 1,
+                Only1) /= false]),
     ok.
 
 
@@ -149,8 +147,8 @@ precondition(#state{started = Started}, {call, _, F, _A}) ->
 postcondition(_S,{call,_,_,_},_R) ->
     true.
 
-next_state(S,_R,{call, _, start, [Segments, Width, MemLevels]}) ->
-    S#state{started = true, segments = Segments, width = Width, mem_levels = MemLevels};
+next_state(S,_R,{call, _, start, [Params]}) ->
+    S#state{started = true, params = Params};
 next_state(S,_V,{call, _, write, [t1, {Key, Val}]}) ->
     S#state{only1=[{Key, Val}|lists:keydelete(Key, 1,
                 S#state.only1)]};
@@ -209,7 +207,7 @@ prop_correct() ->
                                 %% io:format(user, "Checks in ~p\nS: ~p\nT1: ~p\nT2: ~p\n",
                                 %%           [self(), S, get(t1), get(t2)]),
 
-                                case S#state.started of 
+                                case S#state.started of
                                     false ->
                                         true;
                                     _ ->
@@ -224,15 +222,16 @@ prop_correct() ->
                                         D2 = dump(T2),
                                         catch hashtree:destroy(hashtree:close(T1)),
                                         catch hashtree:destroy(hashtree:close(T2)),
+                                        {Segments, Width, MemLevels} = S#state.params,
 
                                         ?WHENFAIL(
                                            begin
                                                eqc:format("t1:\n~p\n", [D1]),
                                                eqc:format("t2:\n~p\n", [D2])
                                            end,
-                                           collect(with_title(mem_levels), S#state.mem_levels,
-                                           collect(with_title(segments), S#state.segments,
-                                           collect(with_title(width), S#state.width,
+                                           collect(with_title(mem_levels), MemLevels,
+                                           collect(with_title(segments), Segments,
+                                           collect(with_title(width), Width,
                                            collect(with_title(length), length(S#state.only1) +
                                                       length(S#state.only2),
                                                      conjunction([{cmds, equals(ok, Res)},
