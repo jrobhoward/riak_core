@@ -131,11 +131,8 @@
 -define(ALL_SEGMENTS, ['*', '*']).
 -define(BIN_TO_INT(B), list_to_integer(binary_to_list(B))).
 
-%% REMOVE
--compile([export_all]).
-
 -ifdef(TEST).
--export([local_compare/2, ref/1]).
+-export([ref/1, local_compare/2]).
 -export([run_local/0,
          run_local/1,
          run_concurrent_build/0,
@@ -464,9 +461,6 @@ mem_levels(#state{mem_levels=M}) ->
 path(#state{path=P}) ->
     P.
 
-ref(#state{ref=Ref}) ->
-    Ref.
-
 %% Note: meta is currently a one per file thing, even if there are multiple
 %%       trees per file. This is intentional. If we want per tree metadata
 %%       this will need to be added as a separate thing.
@@ -575,6 +569,7 @@ esha_update(Ctx, Bin) ->
 
 esha_final(Ctx) ->
     crypto:sha_final(Ctx).
+
 -endif.
 
 %% @doc Check if shutdown/closing of hashtree was clean/dirty by comparing
@@ -1301,6 +1296,10 @@ peval(L) ->
 %%%===================================================================
 %%% EUnit
 %%%===================================================================
+
+-spec ref(hashtree()) -> reference().
+ref(#state{ref=Ref}) ->
+    Ref.
 
 -spec local_compare(hashtree(), hashtree()) -> [keydiff()].
 local_compare(T1, T2) ->
