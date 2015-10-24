@@ -153,7 +153,7 @@ unsafe_close(T) ->
     %% buckets.  Rather than model the queue behavior, flush those and just
     %% check the buckets are correctly recomputed next compare.
     hashtree:flush_buffer(HT),
-    eleveldb:close(hashtree:ref(HT)),
+    hashtree:fake_close(HT),
     put(T, hashtree:new({0,0}, [{segments, Segments},
                                 {width, Width},
                                 {mem_levels, MemLevels},

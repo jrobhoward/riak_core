@@ -132,7 +132,7 @@
 -define(BIN_TO_INT(B), list_to_integer(binary_to_list(B))).
 
 -ifdef(TEST).
--export([ref/1, local_compare/2]).
+-export([fake_close/1, local_compare/2]).
 -export([run_local/0,
          run_local/1,
          run_concurrent_build/0,
@@ -385,7 +385,7 @@ update_perform(State=#state{dirty_segments=Dirty, segments=NumSegments}) ->
                  next_rebuild=incremental}.
 
 maybe_clear_buckets(?ALL_SEGMENTS, State) ->
-    Segments = lists:seq(0, State#state.segments div State#state.width),
+    Segments = lists:seq(0, State#state.segments div State#state.width - 1),
     %% Limit the clear to the disk buckets, then dump the whole tree
     State2 = clear_bucket(State#state.mem_levels, State#state.levels, Segments, State),
     State2#state{tree = dict:new()};
@@ -396,9 +396,8 @@ maybe_clear_buckets(_Segments, State) ->
 clear_bucket(MinLevel, Level, _Segments, State) when Level =< MinLevel ->
     State;
 clear_bucket(MinLevel, Level, Segments, State = #state{width = Width}) ->
-    %% ignoring del_bucket state return
     State2 = lists:foldl(fun(Segment, State1) ->
-                                 del_bucket(Level, Segment, State1)
+                                 del_disk_bucket(Level, Segment, State1)
                          end, State, Segments),
     ParentSegments = lists:usort([Segment div Width || Segment <- Segments]),
     clear_bucket(MinLevel, Level - 1, ParentSegments, State2).
@@ -601,15 +600,6 @@ set_bucket(Level, Bucket, Val, State) ->
             set_disk_bucket(Level, Bucket, Val, State)
     end.
 
--spec del_bucket(integer(), integer(), hashtree()) -> hashtree().
-del_bucket(Level, Bucket, State) ->
-    case Level =< State#state.mem_levels of
-        true ->
-            del_memory_bucket(Level, Bucket, State);
-        false ->
-            del_disk_bucket(Level, Bucket, State)
-    end.
-
 -spec new_segment_store(proplist(), hashtree()) -> hashtree().
 new_segment_store(Opts, State) ->
     DataDir = case proplists:get_value(segment_path, Opts) of
@@ -683,14 +673,10 @@ get_env(Key, Default) ->
                     hashtree(), next_rebuild()) -> hashtree().
 update_levels(0, _, State, _) ->
     State;
-update_levels(Level, Groups, State, full) ->
-    {_, _, NewState, NewBuckets} = rebuild_fold(Level, Groups, State, full),
+update_levels(Level, Groups, State, Type) ->
+    {_, _, NewState, NewBuckets} = rebuild_fold(Level, Groups, State, Type),
     Groups2 = group(NewBuckets, State#state.width),
-    update_levels(Level - 1, Groups2, NewState, full);
-update_levels(Level, Groups, State, incremental) ->
-    {_, _, NewState, NewBuckets} = rebuild_fold(Level, Groups, State, incremental),
-    Groups2 = group(NewBuckets, State#state.width),
-    update_levels(Level - 1, Groups2, NewState, incremental).
+    update_levels(Level - 1, Groups2, NewState, Type).
 
 -spec rebuild_fold(integer(),
                    [{integer(), [{integer(), binary()}]}], hashtree(),
@@ -748,22 +734,16 @@ group(L, Width) ->
 
 -spec get_memory_bucket(integer(), integer(), hashtree()) -> any().
 get_memory_bucket(Level, Bucket, #state{tree=Tree}) ->
-    R = case dict:find({Level, Bucket}, Tree) of
+    case dict:find({Level, Bucket}, Tree) of
         error ->
             orddict:new();
         {ok, Val} ->
             Val
-        end,
-    R.
-
+    end.
 
 -spec set_memory_bucket(integer(), integer(), any(), hashtree()) -> hashtree().
 set_memory_bucket(Level, Bucket, Val, State) ->
     Tree = dict:store({Level, Bucket}, Val, State#state.tree),
-    State#state{tree=Tree}.
-
-del_memory_bucket(Level, Bucket, State) ->
-    Tree = dict:erase({Level, Bucket}, State#state.tree),
     State#state{tree=Tree}.
 
 -spec get_disk_bucket(integer(), integer(), hashtree()) -> any().
@@ -883,8 +863,6 @@ iterator_move(Itr, Seek) ->
               #itr_state{}) -> #itr_state{}.
 iterate({error, invalid_iterator}, IS=#itr_state{current_segment='*'}) ->
     IS;
-iterate({error, invalid_iterator}, IS=#itr_state{remaining_segments=['*']}) ->
-    IS;
 iterate({error, invalid_iterator}, IS=#itr_state{itr=Itr,
                                                  id=Id,
                                                  current_segment=CurSeg,
@@ -894,6 +872,8 @@ iterate({error, invalid_iterator}, IS=#itr_state{itr=Itr,
                                                  final_acc=FinalAcc}) ->
     case Segments of
         [] ->
+            IS;
+        ['*'] ->
             IS;
         [NextSeg | Remaining] ->
             Seek = encode(Id, NextSeg, <<>>),
@@ -1296,10 +1276,6 @@ peval(L) ->
 %%%===================================================================
 %%% EUnit
 %%%===================================================================
-
--spec ref(hashtree()) -> reference().
-ref(#state{ref=Ref}) ->
-    Ref.
 
 -spec local_compare(hashtree(), hashtree()) -> [keydiff()].
 local_compare(T1, T2) ->
