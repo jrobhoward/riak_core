@@ -92,12 +92,16 @@ command(_S = #state{started = Started}) ->
 start(Params) ->
     {Segments, Width, MemLevels} = Params,
     %% Return now so we can store symbolic value in procdict in next_state call
-    put(t1, hashtree:new({0,0}, [{segments, Segments},
-                                 {width, Width},
-                                 {mem_levels, MemLevels}])),
-    put(t2, hashtree:new({0,0}, [{segments, Segments},
-                                 {width, Width},
-                                 {mem_levels, MemLevels}])),
+    T1 = hashtree:new({0,0}, [{segments, Segments},
+                             {width, Width},
+                             {mem_levels, MemLevels}]),
+    put(t1, hashtree:mark_open_and_check({0,0}, T1)),
+
+    T2 = hashtree:new({0,0}, [{segments, Segments},
+                              {width, Width},
+                              {mem_levels, MemLevels}]),
+    put(t2, hashtree:mark_open_and_check({0,0}, T2)),
+
     ets:new(t1, [named_table, public, set]),
     ets:new(t2, [named_table, public, set]),
     ok.
@@ -137,11 +141,17 @@ reopen_tree(T) ->
     {Segments, Width, MemLevels} = {hashtree:segments(HT), hashtree:width(HT),
                                     hashtree:mem_levels(HT)},
     Path = hashtree:path(HT),
-    hashtree:close(HT),
-    put(T, hashtree:new({0,0}, [{segments, Segments},
-                                {width, Width},
-                                {mem_levels, MemLevels},
-                                {segment_path, Path}])),
+
+    UpdatedHT = hashtree:update_tree(HT),
+    CleanClosedHT = hashtree:mark_clean_close({0,0}, UpdatedHT),
+    hashtree:close(CleanClosedHT),
+
+    T1 = hashtree:new({0,0}, [{segments, Segments},
+                              {width, Width},
+                              {mem_levels, MemLevels},
+                              {segment_path, Path}]),
+
+    put(T, hashtree:mark_open_and_check({0,0}, T1)),
     ok.
 
 unsafe_close(T) ->
@@ -154,10 +164,13 @@ unsafe_close(T) ->
     %% check the buckets are correctly recomputed next compare.
     hashtree:flush_buffer(HT),
     hashtree:fake_close(HT),
-    put(T, hashtree:new({0,0}, [{segments, Segments},
-                                {width, Width},
-                                {mem_levels, MemLevels},
-                                {segment_path, Path}])),
+
+    T0 = hashtree:new({0,0}, [{segments, Segments},
+                              {width, Width},
+                              {mem_levels, MemLevels},
+                              {segment_path, Path}]),
+
+    put(T, hashtree:mark_open_and_check({0,0}, T0)),
 
     ok.
 
@@ -265,17 +278,20 @@ prop_correct() ->
                                         true;
                                     _ ->
                                         %% io:format("\nFinal update tree1:\n"),
-                                        T1 = hashtree:update_tree(get(t1)),
+                                        T10 = hashtree:update_tree(get(t1)),
                                         %% io:format("\nFinal update tree2:\n"),
-                                        T2 = hashtree:update_tree(get(t2)),
+                                        T20 = hashtree:update_tree(get(t2)),
 
                                         %% io:format("\nFinal compare:\n"),
-                                        KeyDiff = hashtree:local_compare(T1, T2),
+                                        KeyDiff = hashtree:local_compare(T10, T20),
 
-                                        D1 = try dump(T1) catch _:Err1 -> Err1 end,
-                                        D2 = try dump(T2) catch _:Err2 -> Err2 end,
-                                        catch hashtree:destroy(hashtree:close(T1)),
-                                        catch hashtree:destroy(hashtree:close(T2)),
+                                        D1 = try dump(T10) catch _:Err1 -> Err1 end,
+                                        D2 = try dump(T20) catch _:Err2 -> Err2 end,
+
+                                        T11 = hashtree:mark_clean_close({0,0}, T10),
+                                        T21 = hashtree:mark_clean_close({0,0}, T20),
+                                        catch hashtree:destroy(hashtree:close(T11)),
+                                        catch hashtree:destroy(hashtree:close(T21)),
                                         {Segments, Width, MemLevels} = S#state.params,
 
                                         ?WHENFAIL(

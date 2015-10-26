@@ -124,7 +124,9 @@
          segments/1,
          width/1,
          mem_levels/1,
-         path/1]).
+         path/1,
+         mark_open_and_check/2,
+         mark_clean_close/2]).
 -export([compare2/4]).
 -export([multi_select_segment/3, safe_decode/1]).
 
@@ -166,6 +168,7 @@
 -type proplist() :: proplists:proplist().
 -type orddict() :: orddict:orddict().
 -type index() :: non_neg_integer().
+-type index_n() :: {index(), pos_integer()}.
 
 -type keydiff() :: {missing | remote_missing | different, binary()}.
 
@@ -250,23 +253,18 @@ new({Index,TreeId}, LinkedStore, Options) ->
                    mem_levels=MemLevels,
                    %% dirty_segments=gb_sets:new(),
                    dirty_segments=bitarray_new(NumSegments),
+                   next_rebuild=full,
                    write_buffer=[],
                    write_buffer_count=0,
                    tree=dict:new()},
     State2 = share_segment_store(State, LinkedStore),
-    State3 = check_clean_shutdown(State2),
-    State3.
+    State2.
 
 -spec close(hashtree()) -> hashtree().
 close(State) ->
-    %% Update the tree before closing it (which flushes the buffer
-    %% before the update)
-    State2 = update_tree(State),
-    Opened = read_meta_term(<<"opened">>, 0, State2),
-    _ = write_meta(<<"closed">>, Opened, State2),
-    close_iterator(State2#state.itr),
-    catch eleveldb:close(State2#state.ref),
-    State2#state{itr=undefined}.
+    close_iterator(State#state.itr),
+    catch eleveldb:close(State#state.ref),
+    State#state{itr=undefined}.
 
 close_iterator(Itr) ->
     try
@@ -392,7 +390,6 @@ maybe_clear_buckets(?ALL_SEGMENTS, State) ->
 maybe_clear_buckets(_Segments, State) ->
     State.
 
-
 clear_bucket(MinLevel, Level, _Segments, State) when Level =< MinLevel ->
     State;
 clear_bucket(MinLevel, Level, Segments, State = #state{width = Width}) ->
@@ -432,6 +429,41 @@ rehash_perform(State) ->
             NewState = update_levels(LastLevel, Groups, State, full),
             NewState
     end.
+
+%% @doc Check if shutdown/closing of tree-id was clean/dirty by comparing
+%%      `closed' to `opened' metadata count for the hashtree, and,
+%%      increment opened count for hashtree-id.
+%%
+%%
+%%      If it was a clean shutdown, set `next_rebuild' to be an incremental one.
+%%      Otherwise, if it was a dirty shutdown, set `next_rebuild', instead,
+%%      to be a full one.
+-spec mark_open_and_check(index_n()|binary(), hashtree()) -> hashtree().
+mark_open_and_check(TreeId, State) when is_binary(TreeId) ->
+    MetaTerm = read_meta_term(TreeId, [], State),
+    OpenedCnt = proplists:get_value(opened, MetaTerm, 0),
+    ClosedCnt = proplists:get_value(closed, MetaTerm, 0),
+    _ = write_meta(TreeId, lists:keystore(opened, 1, MetaTerm,
+                                          {opened, OpenedCnt + 1}), State),
+    case ClosedCnt =/= OpenedCnt orelse State#state.mem_levels > 0 of
+        true ->
+            State#state{next_rebuild = full};
+        false ->
+            State#state{next_rebuild = incremental}
+    end;
+mark_open_and_check(TreeId, State) ->
+    mark_open_and_check(term_to_binary(TreeId), State).
+
+%% @doc Call on a clean-close to update the meta for a tree-id's `closed' count
+%%      to match the current `opened' count, which is checked on new/reopen.
+-spec mark_clean_close(index_n()|binary(), hashtree()) -> hashtree().
+mark_clean_close(TreeId, State) when is_binary(TreeId) ->
+    MetaTerm = read_meta_term(TreeId, [], State),
+    OpenedCnt = proplists:get_value(opened, MetaTerm, 0),
+    _ = write_meta(TreeId, lists:keystore(closed, 1, MetaTerm,
+                                          {closed, OpenedCnt}), State);
+mark_clean_close(TreeId, State) ->
+    mark_clean_close(term_to_binary(TreeId), State).
 
 -spec top_hash(hashtree()) -> [] | [{0, binary()}].
 top_hash(State) ->
@@ -482,7 +514,7 @@ read_meta(Key, State) when is_binary(Key) ->
             undefined
     end.
 
--spec read_meta_term(binary(), term(), hashtree()) -> {ok, term()} | term().
+-spec read_meta_term(binary(), term(), hashtree()) -> term().
 read_meta_term(Key, Default, State) when is_binary(Key) ->
     case read_meta(Key, State) of
         {ok, Value} ->
@@ -570,26 +602,6 @@ esha_final(Ctx) ->
     crypto:sha_final(Ctx).
 
 -endif.
-
-%% @doc Check if shutdown/closing of hashtree was clean/dirty by comparing
-%%      `closed' to `opened' metadata count for the hashtree.
-%%
-%%      Only gets called on hashtree:new/3.
-%%
-%%      If it was a clean shutdown, set `next_rebuild' to be an incremental one.
-%%      Otherwise, if it was a dirty shutdown, set `next_rebuild', instead,
-%%      to be a full one.
--spec check_clean_shutdown(hashtree()) -> hashtree().
-check_clean_shutdown(State) ->
-    OpenedCnt = read_meta_term(<<"opened">>, 0, State),
-    ClosedCnt = read_meta_term(<<"closed">>, 0, State),
-    _ = write_meta(<<"opened">>, OpenedCnt + 1, State),
-    case ClosedCnt =/= OpenedCnt orelse State#state.mem_levels > 0 of
-        true ->
-            State#state{next_rebuild = full};
-        false ->
-            State#state{next_rebuild = incremental}
-    end.
 
 -spec set_bucket(integer(), integer(), any(), hashtree()) -> hashtree().
 set_bucket(Level, Bucket, Val, State) ->
@@ -1367,53 +1379,71 @@ delete_without_update_test() ->
     ?assertEqual([{missing, <<"k">>}], Diff2).
 
 opened_closed_test() ->
-    A1 = new({0,0},[{segment_path, "t1000"}]),
-    A2 = insert(<<"totes">>, <<1234:32>>, A1),
-    A3 = update_tree(A2),
+    TreeId0 = {0,0},
+    TreeId1 = term_to_binary({0,0}),
+    A1 = new(TreeId0, [{segment_path, "t1000"}]),
+    A2 = mark_open_and_check(TreeId0, A1),
+    A3 = insert(<<"totes">>, <<1234:32>>, A2),
+    A4 = update_tree(A3),
 
-    B1 = new({0,0},[{segment_path, "t2000"}]),
+    B1 = new(TreeId0,[{segment_path, "t2000"}]),
     B2 = insert(<<"totes">>, <<1234:32>>, B1),
     B3 = update_tree(B2),
 
-    StatusA01 = {read_meta_term(<<"opened">>, undefined, A3),
-                 read_meta_term(<<"closed">>, undefined, A3)},
-    StatusB01 = {read_meta_term(<<"opened">>, undefined, B3),
-                 read_meta_term(<<"closed">>, undefined, B3)},
+    StatusA4 = {proplists:get_value(opened, read_meta_term(TreeId1, [], A4)),
+                proplists:get_value(closed, read_meta_term(TreeId1, [], A4))},
+    StatusB3 = {proplists:get_value(opened, read_meta_term(TreeId1, [], B3)),
+                proplists:get_value(closed, read_meta_term(TreeId1, [], B3))},
 
-    close(A3),
+    A5 = mark_clean_close(TreeId0, A4),
+    StatusA5 = {proplists:get_value(opened, read_meta_term(TreeId1, [], A5)),
+                proplists:get_value(closed, read_meta_term(TreeId1, [], A5))},
+
+    close(A5),
     close(B3),
 
-    AA1 = new({0,0},[{segment_path, "t1000"}]),
-    AA2 = update_tree(AA1),
-    StatusAA2 = {read_meta_term(<<"opened">>, undefined, AA2),
-                 read_meta_term(<<"closed">>, undefined, AA2)},
+    AA1 = new(TreeId0, [{segment_path, "t1000"}]),
+    AA2 = mark_open_and_check(TreeId0, AA1),
+    AA3 = update_tree(AA2),
+    StatusAA3 = {proplists:get_value(opened, read_meta_term(TreeId1, [], AA3)),
+                 proplists:get_value(closed, read_meta_term(TreeId1, [], AA3))},
 
-    fake_close(AA2),
+    fake_close(AA3),
 
-    AAA1 = new({0,0},[{segment_path, "t1000"}]),
-    StatusAAA1 = {read_meta_term(<<"opened">>, undefined, AAA1),
-                  read_meta_term(<<"closed">>, undefined, AAA1)},
+    AAA1 = new(TreeId0,[{segment_path, "t1000"}]),
+    AAA2 = mark_open_and_check(TreeId0, AAA1),
+    StatusAAA2 = {proplists:get_value(opened, read_meta_term(TreeId1, [], AAA2)),
+                  proplists:get_value(closed, read_meta_term(TreeId1, [], AAA2))},
 
-    close(AAA1),
+    AAA3 = mark_clean_close(TreeId0, AAA2),
+    close(AAA3),
 
     AAAA1 = new({0,0},[{segment_path, "t1000"}]),
-    StatusAAAA1 = {read_meta_term(<<"opened">>, undefined, AAAA1),
-                   read_meta_term(<<"closed">>, undefined, AAAA1)},
+    AAAA2 = mark_open_and_check(TreeId0, AAAA1),
+    StatusAAAA2 = {proplists:get_value(opened, read_meta_term(TreeId1, [], AAAA2)),
+                   proplists:get_value(closed, read_meta_term(TreeId1, [], AAAA2))},
 
-    close(AAAA1),
+    AAAA3 = mark_clean_close(TreeId0, AAAA2),
+    StatusAAAA3 = {proplists:get_value(opened, read_meta_term(TreeId1, [], AAAA3)),
+                   proplists:get_value(closed, read_meta_term(TreeId1, [], AAAA3))},
+    close(AAAA3),
     destroy(B3),
-    destroy(A3),
-    destroy(AA2),
-    destroy(AAA1),
-    destroy(AAAA1),
+    destroy(A5),
+    destroy(AA3),
+    destroy(AAA3),
+    destroy(AAAA3),
 
-    ?assertEqual({1,undefined}, StatusA01),
-    ?assertEqual({1,undefined}, StatusB01),
-    ?assertEqual({2,1}, StatusAA2),
-    ?assertEqual(incremental, AA1#state.next_rebuild),
-    ?assertEqual({3,1}, StatusAAA1),
+    ?assertEqual({1,undefined}, StatusA4),
+    ?assertEqual({undefined,undefined}, StatusB3),
+    ?assertEqual(incremental, A2#state.next_rebuild),
+    ?assertEqual(full, B1#state.next_rebuild),
+    ?assertEqual({1,1}, StatusA5),
+    ?assertEqual({2,1}, StatusAA3),
+    ?assertEqual(incremental, AA2#state.next_rebuild),
+    ?assertEqual({3,1}, StatusAAA2),
     ?assertEqual(full, AAA1#state.next_rebuild),
-    ?assertEqual({4,3}, StatusAAAA1).
+    ?assertEqual({4,3}, StatusAAAA2),
+    ?assertEqual({4,4}, StatusAAAA3).
 
 -endif.
 
