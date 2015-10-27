@@ -125,6 +125,7 @@
          width/1,
          mem_levels/1,
          path/1,
+         next_rebuild/1,
          mark_open_and_check/2,
          mark_clean_close/2]).
 -export([compare2/4]).
@@ -491,6 +492,10 @@ mem_levels(#state{mem_levels=M}) ->
 -spec path(hashtree()) -> string().
 path(#state{path=P}) ->
     P.
+
+-spec next_rebuild(hashtree()) -> next_rebuild().
+next_rebuild(#state{next_rebuild=NextRebuild}) ->
+    NextRebuild.
 
 %% Note: meta is currently a one per file thing, even if there are multiple
 %%       trees per file. This is intentional. If we want per tree metadata
