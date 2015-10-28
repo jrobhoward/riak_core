@@ -198,10 +198,6 @@ reconcile() ->
                 Only1) /= false]),
     ok.
 
-%% write_differing(Tree1, Tree2, {Key, Hash1}, Hash2) ->
-%%     {{Key, Hash1}, {Key, Hash2}, hashtree:insert(Key, Hash1, Tree1),
-%%         hashtree:insert(Key, Hash2, Tree2)}.
-
 precondition(#state{started = Started}, {call, _, F, _A}) ->
     case F of
         start ->

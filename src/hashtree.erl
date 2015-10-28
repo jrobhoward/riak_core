@@ -126,6 +126,7 @@
          mem_levels/1,
          path/1,
          next_rebuild/1,
+         mark_open_empty/2,
          mark_open_and_check/2,
          mark_clean_close/2]).
 -export([compare2/4]).
@@ -431,6 +432,13 @@ rehash_perform(State) ->
             NewState
     end.
 
+%% @doc Mark/clear metadata for tree-id opened/closed.
+-spec mark_open_empty(index_n()|binary(), hashtree()) -> hashtree().
+mark_open_empty(TreeId, State) when is_binary(TreeId) ->
+    write_meta(TreeId, [{opened, 0}, {closed, 0}], State);
+mark_open_empty(TreeId, State) ->
+    mark_open_empty(term_to_binary(TreeId), State).
+
 %% @doc Check if shutdown/closing of tree-id was clean/dirty by comparing
 %%      `closed' to `opened' metadata count for the hashtree, and,
 %%      increment opened count for hashtree-id.
@@ -443,7 +451,7 @@ rehash_perform(State) ->
 mark_open_and_check(TreeId, State) when is_binary(TreeId) ->
     MetaTerm = read_meta_term(TreeId, [], State),
     OpenedCnt = proplists:get_value(opened, MetaTerm, 0),
-    ClosedCnt = proplists:get_value(closed, MetaTerm, 0),
+    ClosedCnt = proplists:get_value(closed, MetaTerm, -1),
     _ = write_meta(TreeId, lists:keystore(opened, 1, MetaTerm,
                                           {opened, OpenedCnt + 1}), State),
     case ClosedCnt =/= OpenedCnt orelse State#state.mem_levels > 0 of
@@ -878,6 +886,9 @@ iterator_move(Itr, Seek) ->
 
 -spec iterate({'error','invalid_iterator'} | {'ok',binary(),binary()},
               #itr_state{}) -> #itr_state{}.
+
+%% Ended up at an invalid_iterator likely due to encountering a missing dirty
+%% segment - e.g. segment dirty, but removed last entries for it
 iterate({error, invalid_iterator}, IS=#itr_state{current_segment='*'}) ->
     IS;
 iterate({error, invalid_iterator}, IS=#itr_state{itr=Itr,
@@ -1387,25 +1398,27 @@ opened_closed_test() ->
     TreeId0 = {0,0},
     TreeId1 = term_to_binary({0,0}),
     A1 = new(TreeId0, [{segment_path, "t1000"}]),
-    A2 = mark_open_and_check(TreeId0, A1),
-    A3 = insert(<<"totes">>, <<1234:32>>, A2),
-    A4 = update_tree(A3),
+    A2 = mark_open_empty(TreeId0, A1),
+    A3 = mark_open_and_check(TreeId0, A2),
+    A4 = insert(<<"totes">>, <<1234:32>>, A3),
+    A5 = update_tree(A4),
 
-    B1 = new(TreeId0,[{segment_path, "t2000"}]),
-    B2 = insert(<<"totes">>, <<1234:32>>, B1),
-    B3 = update_tree(B2),
+    B1 = new(TreeId0, [{segment_path, "t2000"}]),
+    B2 = mark_open_empty(TreeId0, B1),
+    B3 = insert(<<"totes">>, <<1234:32>>, B2),
+    B4 = update_tree(B3),
 
-    StatusA4 = {proplists:get_value(opened, read_meta_term(TreeId1, [], A4)),
-                proplists:get_value(closed, read_meta_term(TreeId1, [], A4))},
-    StatusB3 = {proplists:get_value(opened, read_meta_term(TreeId1, [], B3)),
-                proplists:get_value(closed, read_meta_term(TreeId1, [], B3))},
-
-    A5 = mark_clean_close(TreeId0, A4),
     StatusA5 = {proplists:get_value(opened, read_meta_term(TreeId1, [], A5)),
                 proplists:get_value(closed, read_meta_term(TreeId1, [], A5))},
+    StatusB4 = {proplists:get_value(opened, read_meta_term(TreeId1, [], B4)),
+                proplists:get_value(closed, read_meta_term(TreeId1, [], B4))},
 
-    close(A5),
-    close(B3),
+    A6 = mark_clean_close(TreeId0, A5),
+    StatusA6 = {proplists:get_value(opened, read_meta_term(TreeId1, [], A6)),
+                proplists:get_value(closed, read_meta_term(TreeId1, [], A6))},
+
+    close(A6),
+    close(B4),
 
     AA1 = new(TreeId0, [{segment_path, "t1000"}]),
     AA2 = mark_open_and_check(TreeId0, AA1),
@@ -1438,11 +1451,11 @@ opened_closed_test() ->
     destroy(AAA3),
     destroy(AAAA3),
 
-    ?assertEqual({1,undefined}, StatusA4),
-    ?assertEqual({undefined,undefined}, StatusB3),
-    ?assertEqual(incremental, A2#state.next_rebuild),
-    ?assertEqual(full, B1#state.next_rebuild),
-    ?assertEqual({1,1}, StatusA5),
+    ?assertEqual({1,0}, StatusA5),
+    ?assertEqual({0,0}, StatusB4),
+    ?assertEqual(incremental, A3#state.next_rebuild),
+    ?assertEqual(full, B2#state.next_rebuild),
+    ?assertEqual({1,1}, StatusA6),
     ?assertEqual({2,1}, StatusAA3),
     ?assertEqual(incremental, AA2#state.next_rebuild),
     ?assertEqual({3,1}, StatusAAA2),
